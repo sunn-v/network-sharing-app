@@ -1,0 +1,26 @@
+name: build-windows
+
+# Manual only: Actions tab -> build-windows -> Run workflow.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p lanshare-core
+      # Unsigned build for testing on a Windows machine.
+      - run: npx -y @tauri-apps/cli@2 build
+        working-directory: app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: network-sharing-windows
+          path: |
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi
+          if-no-files-found: error
