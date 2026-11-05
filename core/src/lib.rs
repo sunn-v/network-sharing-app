@@ -131,7 +131,8 @@ enum Req {
     Pair { name: String },
     Shares,
     List { share: String, path: String },
-    Read { share: String, path: String, offset: u64 },
+    /// `len` = how many bytes from `offset`; absent = to the end (older clients never send it).
+    Read { share: String, path: String, offset: u64, #[serde(default)] len: Option<u64> },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -162,13 +163,16 @@ pub struct Node {
     /// Runtime to spawn jobs on, so `download` works from non-async callers too.
     rt: tokio::runtime::Handle,
     drive_root: PathBuf,
+    /// Full-copy LAN Drive. Off where the OS layer serves files on demand instead.
+    mirror: bool,
     drive_status: Mutex<HashMap<(String, String), DriveStatus>>,
 }
 
 impl Node {
-    /// Load (or create) the config in `data_dir`, bind the endpoint and start discovery, serving
-    /// and LAN Drive syncing into `drive_root`.
-    pub async fn start(data_dir: PathBuf, drive_root: PathBuf) -> Result<Arc<Node>> {
+    /// Load (or create) the config in `data_dir`, bind the endpoint and start discovery and serving.
+    /// With `mirror`, LAN Drive items are fully copied into `drive_root`; without it an OS layer
+    /// (Windows Cloud Files, macOS File Provider) shows them there and fetches data on demand.
+    pub async fn start(data_dir: PathBuf, drive_root: PathBuf, mirror: bool) -> Result<Arc<Node>> {
         fs::create_dir_all(&data_dir).await?;
         let cfg = match fs::read(data_dir.join("config.json")).await {
             Ok(bytes) => serde_json::from_slice(&bytes).context("config.json is corrupt")?,
@@ -204,13 +208,16 @@ impl Node {
             next_job: Mutex::new(1),
             rt: tokio::runtime::Handle::current(),
             drive_root,
+            mirror,
             drive_status: Mutex::default(),
         });
         node.save().await?;
         node.advertise()?;
         tokio::spawn(node.clone().discover(events));
         tokio::spawn(node.clone().serve());
-        tokio::spawn(node.clone().drive_loop());
+        if mirror {
+            tokio::spawn(node.clone().drive_loop());
+        }
         Ok(node)
     }
 
@@ -429,7 +436,7 @@ impl Node {
             let offset = fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0).min(f.size);
             let mut out = fs::OpenOptions::new().create(true).append(true).open(&part).await?;
             let (mut send, mut recv) = self.open(peer).await?;
-            write_msg(&mut send, &Req::Read { share: share.into(), path: f.remote.clone(), offset }).await?;
+            write_msg(&mut send, &Req::Read { share: share.into(), path: f.remote.clone(), offset, len: None }).await?;
             match read_msg::<Resp>(&mut recv).await? {
                 Resp::Read { size } => ensure!(size == f.size, "{} changed on the other device", f.remote),
                 Resp::Error { msg } => bail!(msg),
@@ -493,6 +500,38 @@ impl Node {
 
     // ----- LAN Drive -----
 
+    /// Read `len` bytes of a remote file from `offset` (clipped to its end), handing chunks to
+    /// `sink` in order. Returns the file's full size. Used to fill on-demand files.
+    pub async fn read_range(&self, peer: &str, share: &str, path: &str, offset: u64, len: u64, mut sink: impl FnMut(&[u8]) -> Result<()>) -> Result<u64> {
+        let (mut send, mut recv) = self.open(peer).await?;
+        write_msg(&mut send, &Req::Read { share: share.into(), path: path.into(), offset, len: Some(len) }).await?;
+        send.finish()?;
+        let size = match read_msg::<Resp>(&mut recv).await? {
+            Resp::Read { size } => size,
+            Resp::Error { msg } => bail!(msg),
+            _ => bail!("unexpected reply"),
+        };
+        let want = len.min(size.saturating_sub(offset));
+        let mut got = 0;
+        let mut buf = vec![0u8; 256 * 1024];
+        while got < want {
+            let Some(n) = recv.read(&mut buf).await? else { break };
+            sink(&buf[..n])?;
+            got += n as u64;
+        }
+        ensure!(got == want, "{path}: got {got} of {want} bytes");
+        Ok(size)
+    }
+
+    /// Runtime handle, so OS callback threads can block on async calls.
+    pub fn runtime(&self) -> &tokio::runtime::Handle {
+        &self.rt
+    }
+
+    pub fn drive_items(&self) -> Vec<DriveItem> {
+        self.cfg.lock().unwrap().drive.clone()
+    }
+
     pub fn drive(&self) -> Vec<DriveView> {
         let items = self.cfg.lock().unwrap().drive.clone();
         let devices = self.devices();
@@ -502,7 +541,10 @@ impl Node {
             .map(|item| {
                 let d = devices.iter().find(|d| d.id == item.peer);
                 let mut st = status.get(&(item.peer.clone(), item.share.clone())).cloned().unwrap_or_default();
-                if st.state.is_empty() || (st.state != "syncing" && !d.is_some_and(|d| d.online)) {
+                let online = d.is_some_and(|d| d.online);
+                if !self.mirror {
+                    st.state = if online { "ondemand" } else { "waiting" }.into();
+                } else if st.state.is_empty() || (st.state != "syncing" && !online) {
                     st.state = "waiting".into();
                 }
                 DriveView { peer_name: d.map(|d| d.name.clone()).unwrap_or_default(), status: st, item }
@@ -514,23 +556,27 @@ impl Node {
         &self.drive_root
     }
 
-    /// Mirror a remote share into `<drive root>/<device>/<share>` and keep it updated.
-    pub async fn add_to_drive(self: &Arc<Self>, peer: &str, share: &str, name: &str) -> Result<()> {
+    /// Put a remote share into `<drive root>/<device>/<share>`: mirrored, or left to the OS layer.
+    /// Returns the item (already-added items are returned as they are).
+    pub async fn add_to_drive(self: &Arc<Self>, peer: &str, share: &str, name: &str) -> Result<DriveItem> {
         let device = self.devices().into_iter().find(|d| d.id == peer).map(|d| d.name).unwrap_or_default();
         let path = self.drive_root.join(folder_name(&device, &peer[..8])).join(folder_name(name, share));
         {
             let mut cfg = self.cfg.lock().unwrap();
-            if cfg.drive.iter().any(|i| i.peer == peer && i.share == share) {
-                return Ok(());
+            if let Some(i) = cfg.drive.iter().find(|i| i.peer == peer && i.share == share) {
+                return Ok(i.clone());
             }
             cfg.drive.push(DriveItem { peer: peer.into(), share: share.into(), name: name.into(), path });
         }
         self.save().await?;
         self.emit(Event::Drive);
         let item = self.cfg.lock().unwrap().drive.last().cloned().unwrap();
-        let node = self.clone();
-        self.rt.spawn(async move { node.sync_item(&item).await });
-        Ok(())
+        if self.mirror {
+            let node = self.clone();
+            let item = item.clone();
+            self.rt.spawn(async move { node.sync_item(&item).await });
+        }
+        Ok(item)
     }
 
     /// Stop mirroring. Files already in LAN Drive stay where they are.
@@ -721,13 +767,13 @@ impl Node {
                 entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
                 Resp::List { entries }
             }
-            Req::Read { share, path, offset } => {
+            Req::Read { share, path, offset, len } => {
                 let file = resolve(&root_of(&share)?, &path).await?;
                 let mut f = fs::File::open(&file).await?;
                 let size = f.metadata().await?.len();
                 write_msg(send, &Resp::Read { size }).await?;
                 tokio::io::AsyncSeekExt::seek(&mut f, std::io::SeekFrom::Start(offset.min(size))).await?;
-                tokio::io::copy(&mut f, send).await?;
+                tokio::io::copy(&mut tokio::io::AsyncReadExt::take(f, len.unwrap_or(u64::MAX)), send).await?;
                 send.finish()?;
                 let _ = send.stopped().await;
                 return Ok(None);
@@ -801,6 +847,8 @@ async fn unique_path(p: &Path) -> PathBuf {
     }
     unreachable!()
 }
+
+pub mod bridge;
 
 #[cfg(test)]
 mod tests;

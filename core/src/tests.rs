@@ -31,8 +31,8 @@ async fn wait_until(mut f: impl FnMut() -> bool) {
 #[tokio::test(flavor = "multi_thread")]
 async fn pair_share_browse_download() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let a = Node::start(tmp.path().join("a"), tmp.path().join("drive-a")).await?;
-    let b = Node::start(tmp.path().join("b"), tmp.path().join("drive-b")).await?;
+    let a = Node::start(tmp.path().join("a"), tmp.path().join("drive-a"), true).await?;
+    let b = Node::start(tmp.path().join("b"), tmp.path().join("drive-b"), true).await?;
     let (aid, bid) = (a.id(), b.id());
 
     wait_until(|| a.devices().iter().any(|d| d.id == bid && d.online)).await;
@@ -100,8 +100,8 @@ async fn pair_share_browse_download() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn resumes_partial_download() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let a = Node::start(tmp.path().join("a"), tmp.path().join("drive-a")).await?;
-    let b = Node::start(tmp.path().join("b"), tmp.path().join("drive-b")).await?;
+    let a = Node::start(tmp.path().join("a"), tmp.path().join("drive-a"), true).await?;
+    let b = Node::start(tmp.path().join("b"), tmp.path().join("drive-b"), true).await?;
     let (aid, bid) = (a.id(), b.id());
     wait_until(|| a.devices().iter().any(|d| d.id == bid && d.online)).await;
     // Pair directly in config, as if done earlier.
@@ -148,8 +148,8 @@ fn folder_name_is_safe() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rename_and_lan_drive() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let a = Node::start(tmp.path().join("a"), tmp.path().join("drive-a")).await?;
-    let b = Node::start(tmp.path().join("b"), tmp.path().join("drive-b")).await?;
+    let a = Node::start(tmp.path().join("a"), tmp.path().join("drive-a"), true).await?;
+    let b = Node::start(tmp.path().join("b"), tmp.path().join("drive-b"), true).await?;
     let (aid, bid) = (a.id(), b.id());
     wait_until(|| a.devices().iter().any(|d| d.id == bid && d.online)).await;
 
@@ -181,5 +181,91 @@ async fn rename_and_lan_drive() -> Result<()> {
     a.remove_from_drive(&bid, &share.id).await?;
     assert!(a.drive().is_empty());
     assert!(fs::metadata(&mirrored).await.is_ok(), "removing from LAN Drive keeps the files");
+    Ok(())
+}
+
+/// On-demand mode: no copying, and any byte range of a remote file can be read.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_demand_reads_ranges() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let a = Node::start(tmp.path().join("a"), tmp.path().join("drive-a"), false).await?;
+    let b = Node::start(tmp.path().join("b"), tmp.path().join("drive-b"), false).await?;
+    let (aid, bid) = (a.id(), b.id());
+    wait_until(|| a.devices().iter().any(|d| d.id == bid && d.online)).await;
+    a.cfg.lock().unwrap().paired.insert(bid.clone(), "b".into());
+    b.cfg.lock().unwrap().paired.insert(aid.clone(), "a".into());
+
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).await?;
+    let data: Vec<u8> = (0..2_000_000u32).map(|i| (i % 253) as u8).collect();
+    fs::write(src.join("v.bin"), &data).await?;
+    let share = b.add_share(src, Some(aid)).await?;
+
+    let item = a.add_to_drive(&bid, &share.id, &share.name).await?;
+    assert_eq!(a.drive()[0].status.state, "ondemand");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(fs::metadata(&item.path).await.is_err(), "on-demand mode must not copy anything");
+
+    let mut got = vec![];
+    let size = a.read_range(&bid, &share.id, "v.bin", 1_234_567, 300_000, |c| Ok(got.extend_from_slice(c))).await?;
+    assert_eq!(size, 2_000_000);
+    assert_eq!(got, &data[1_234_567..1_534_567]);
+
+    // A range past the end is clipped to the file.
+    got.clear();
+    a.read_range(&bid, &share.id, "v.bin", 1_999_000, 50_000, |c| Ok(got.extend_from_slice(c))).await?;
+    assert_eq!(got, &data[1_999_000..]);
+    Ok(())
+}
+
+async fn http_get(port: u16, token: &str, target: &str) -> Result<(String, Vec<u8>)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+    s.write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n").as_bytes()).await?;
+    let mut raw = vec![];
+    s.read_to_end(&mut raw).await?;
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    Ok((String::from_utf8_lossy(&raw[..split]).into_owned(), raw[split + 4..].to_vec()))
+}
+
+/// The macOS extension's view of LAN Drive, over the localhost bridge.
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_lists_and_reads() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let a = Node::start(tmp.path().join("a"), tmp.path().join("drive-a"), false).await?;
+    let b = Node::start(tmp.path().join("b"), tmp.path().join("drive-b"), false).await?;
+    let (aid, bid) = (a.id(), b.id());
+    wait_until(|| a.devices().iter().any(|d| d.id == bid && d.online)).await;
+    a.cfg.lock().unwrap().paired.insert(bid.clone(), "b".into());
+    b.cfg.lock().unwrap().paired.insert(aid.clone(), "a".into());
+    b.set_name("Máy B").await?;
+    wait_until(|| a.devices().iter().any(|d| d.name == "Máy B")).await;
+
+    let src = tmp.path().join("Ảnh");
+    fs::create_dir_all(src.join("Đà Lạt")).await?;
+    fs::write(src.join("Đà Lạt/1.jpg"), vec![9u8; 300_000]).await?;
+    let share = b.add_share(src, Some(aid)).await?;
+    a.add_to_drive(&bid, &share.id, &share.name).await?;
+
+    let port = bridge::start(a.clone(), "secret".into()).await?;
+    let (head, _) = http_get(port, "wrong", "/items?id=root").await?;
+    assert!(head.starts_with("HTTP/1.1 401"), "{head}");
+
+    let json = |b: Vec<u8>| serde_json::from_slice::<serde_json::Value>(&b).unwrap();
+    let (_, body) = http_get(port, "secret", "/items?id=root").await?;
+    assert_eq!(json(body)[0]["name"], "Máy B");
+    let (_, body) = http_get(port, "secret", &format!("/items?id=d/{bid}")).await?;
+    assert_eq!(json(body)[0]["id"], format!("s/{bid}/{}", share.id));
+    let (_, body) = http_get(port, "secret", &format!("/items?id=s/{bid}/{}", share.id)).await?;
+    assert_eq!(json(body)[0]["name"], "Đà Lạt");
+
+    // Swift percent-encodes the id; the space and Vietnamese letters must survive.
+    let file = format!("f/{bid}/{}/%C4%90%C3%A0%20L%E1%BA%A1t/1.jpg", share.id);
+    let (_, body) = http_get(port, "secret", &format!("/item?id={file}")).await?;
+    let item = json(body);
+    assert_eq!((item["size"].as_u64(), item["parent"].as_str()), (Some(300_000), Some(format!("f/{bid}/{}/Đà Lạt", share.id).as_str())));
+    let (head, body) = http_get(port, "secret", &format!("/read?id={file}")).await?;
+    assert!(head.contains("Content-Length: 300000"), "{head}");
+    assert_eq!(body, vec![9u8; 300_000]);
     Ok(())
 }

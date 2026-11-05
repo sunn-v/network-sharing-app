@@ -14,3 +14,12 @@ tauri-plugin-opener = "2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[target.'cfg(windows)'.dependencies]
+cloud-filter = "0.0.6"
+nt-time = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString"] }
+block2 = "0.6"

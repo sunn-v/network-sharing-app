@@ -1,0 +1,10 @@
+{
+  "bundle": {
+    "macOS": {
+      "entitlements": "macos/App.entitlements",
+      "files": {
+        "PlugIns/LANDrive.appex": "macos/build/Release/LANDrive.appex"
+      }
+    }
+  }
+}

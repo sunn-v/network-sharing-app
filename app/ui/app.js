@@ -68,6 +68,8 @@ async function refresh() {
   const snap = await invoke('snapshot');
   S.me = { id: snap.id, name: snap.name };
   S.driveRoot = snap.drive_root;
+  S.onDemand = snap.on_demand;
+  S.driveError = snap.drive_error;
   S.devices = snap.devices.map((d) => ({ ...d, name: d.name || 'Máy chưa đặt tên' }));
   render();
 }
@@ -248,6 +250,8 @@ function driveState(i) {
     return `<div class="cell-progress"><span class="accent">${s.total ? `Đang đồng bộ · ${pct}%${r ? ` · ${r}` : ''}` : 'Đang kiểm tra thay đổi…'}</span>
       <div class="bar thin" role="progressbar" aria-label="Tiến độ ${esc(i.name)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div style="width:${pct}%"></div></div></div>`;
   }
+  if (s.state === 'ondemand') return '<span class="ok">Sẵn sàng · file chỉ tải khi mở</span>';
+  if (S.onDemand) return '<span class="warn">Máy đang offline · file đã mở trước đó vẫn dùng được</span>';
   if (s.state === 'synced') return `<span class="ok">Đã cập nhật · ${ago(s.last_sync)}</span>`;
   if (s.state === 'error') return `<span class="error">Lỗi: ${esc(s.message)}</span>`;
   return `<span class="warn">Chờ máy online${s.last_sync ? ` · bản cũ vẫn mở được` : ''}</span>`;
@@ -261,13 +265,17 @@ function viewDrive() {
     <td class="actions-cell">
       <button type="button" class="btn small" data-action="open-path" data-path="${esc(i.path)}">Mở</button>
       <button type="button" class="btn small" data-action="remove-drive" data-peer="${esc(i.peer)}" data-id="${esc(i.share)}">Gỡ</button></td></tr>`).join('');
+  const problem = S.driveError ? `<p class="sub error" role="alert">LAN Drive on-demand chưa chạy được: ${esc(S.driveError)}</p>` : '';
   return `<div class="head"><div><h1>LAN Drive</h1>
-      <p class="sub">${esc(S.driveRoot)} · mỗi máy một thư mục, tự cập nhật khi máy kia online</p></div>
+      <p class="sub">${esc(S.driveRoot)} · mỗi máy một thư mục${S.onDemand ? ', file tải khi mở' : ', tự cập nhật khi máy kia online'}</p></div>
       <button type="button" class="btn primary" data-action="open-path" data-path="${esc(S.driveRoot)}">Mở folder LAN Drive</button></div>
+    ${problem}
     ${S.drive.length ? `<div class="scroll table-box"><table>
       <thead><tr><th>Folder</th><th>Từ máy</th><th>Trạng thái</th><th><span class="sr">Thao tác</span></th></tr></thead>
       <tbody>${rows}</tbody></table></div>
-      <p class="sub">LAN Drive là bản sao một chiều: sửa file trong đây sẽ bị ghi đè khi máy gốc thay đổi. File bị xoá ở máy gốc vẫn được giữ lại ở đây.</p>`
+      <p class="sub">${S.onDemand
+        ? 'Mọi file hiện sẵn trong LAN Drive nhưng chỉ tải về khi bạn mở. Máy kia cần online lúc mở file lần đầu.'
+        : 'LAN Drive là bản sao một chiều: sửa file trong đây sẽ bị ghi đè khi máy gốc thay đổi. File bị xoá ở máy gốc vẫn được giữ lại ở đây.'}</p>`
     : '<div class="scroll"><p class="empty">Chưa có folder nào. Vào một máy đã ghép và bấm "Thêm vào LAN Drive" ở folder bạn muốn giữ bản sao.</p></div>'}`;
 }
 
@@ -382,7 +390,10 @@ const actions = {
     loadDevice(true);
   },
   'remove-drive': async (el) => {
-    if (!(await ask('Folder sẽ ngừng tự cập nhật. File đã có trong LAN Drive vẫn được giữ lại.', { title: 'Gỡ khỏi LAN Drive?' }))) return;
+    const text = S.onDemand
+      ? 'Folder sẽ biến mất khỏi LAN Drive trên máy này. File gốc trên máy kia không bị ảnh hưởng. File bạn tự lưu vào folder đó cũng bị xoá.'
+      : 'Folder sẽ ngừng tự cập nhật. File đã có trong LAN Drive vẫn được giữ lại.';
+    if (!(await ask(text, { title: 'Gỡ khỏi LAN Drive?', kind: 'warning' }))) return;
     await invoke('remove_from_drive', { peer: el.dataset.peer, share: el.dataset.id });
     await loadDrive(); render();
   },

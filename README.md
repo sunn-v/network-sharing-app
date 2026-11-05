@@ -22,7 +22,24 @@ cargo run -p network-sharing         # chạy app ở chế độ dev
 cd app && npx @tauri-apps/cli@2 build  # đóng gói .app/.dmg hoặc .exe/.msi
 ```
 
-Workflow `app` trên GitHub Actions build bản macOS (.dmg) và Windows (.exe, .msi) chưa ký, để thử.
+Workflow `build-windows` (chạy tay: `gh workflow run build-windows`) build bản Windows (.exe, .msi) chưa ký để thử.
+
+## LAN Drive on-demand
+
+Folder máy khác chia sẻ hiện sẵn trong Explorer/Finder nhưng chỉ tải khi mở (giống OneDrive/Google Drive). Chỉ đọc: sửa, xoá, đổi tên không đi ngược về máy gốc.
+
+- **Windows** (`app/src/ondemand/windows.rs`): Cloud Files API. `~/LAN Drive` là sync root, hiện trong Explorer kèm biểu tượng trạng thái mây. Build thường (`npx @tauri-apps/cli@2 build`) là có. Lần đầu chạy, nếu `~/LAN Drive` của bản cũ (tải bản cứng) còn đó thì nó được đổi tên thành `LAN Drive (bản cũ)`, không mất file.
+- **macOS** (`app/macos/`): File Provider extension viết bằng Swift, hiện ở thanh bên Finder dưới mục Locations. Extension hỏi app qua cầu nối HTTP trên 127.0.0.1 có token (`core/src/bridge.rs`). Phải build bằng script:
+  ```sh
+  brew install xcodegen
+  export APPLE_TEAM_ID=XXXXXXXXXX
+  export APPLE_SIGNING_IDENTITY="Developer ID Application: Tên (XXXXXXXXXX)"
+  app/macos/build.sh
+  ```
+  Kiểm tra extension giữ đúng entitlements sau khi đóng gói:
+  `codesign -d --entitlements - "target/release/bundle/macos/Network Sharing.app/Contents/PlugIns/LANDrive.appex"` phải có `app-sandbox` và `application-groups`.
+  Bản `cargo run` hoặc build không qua script sẽ không có extension; khi đó LAN Drive quay về kiểu tải bản cứng vào `~/LAN Drive`.
+- **Linux**: tải bản cứng.
 
 ## Lưu ý theo hệ điều hành
 
@@ -36,4 +53,4 @@ Workflow `app` trên GitHub Actions build bản macOS (.dmg) và Windows (.exe, 
 
 ## Chưa có
 
-LAN Drive (folder tự đồng bộ), ổ on-demand kiểu Google Drive, Linux, ký và notarize trong CI. Xem kế hoạch trong tài liệu dự án.
+Ghi ngược từ LAN Drive về máy gốc, LAN Drive on-demand trên Linux, ký và notarize trong CI. Xem kế hoạch trong tài liệu dự án.

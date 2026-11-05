@@ -1,0 +1,26 @@
+# xcodegen spec for the LAN Drive File Provider extension (built by build.sh, never committed as .xcodeproj).
+name: LANDrive
+options:
+  deploymentTarget:
+    macOS: "12.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+targets:
+  LANDrive:
+    type: app-extension
+    platform: macOS
+    sources: [LANDrive]
+    settings:
+      base:
+        PRODUCT_NAME: LANDrive
+        # Must sit under the app's identifier (tauri.conf.json).
+        PRODUCT_BUNDLE_IDENTIFIER: cafe.getapps.networksharing.LANDrive
+        INFOPLIST_FILE: LANDrive/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: LANDrive/LANDrive.entitlements
+        ENABLE_HARDENED_RUNTIME: YES
+    dependencies:
+      - sdk: FileProvider.framework
+      - sdk: UniformTypeIdentifiers.framework
