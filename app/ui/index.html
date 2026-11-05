@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network Sharing</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <nav class="side" aria-label="Điều hướng chính">
+    <p class="brand">Network Sharing</p>
+    <button type="button" class="nav-item" data-action="home" aria-current="page">Thiết bị</button>
+    <button type="button" class="nav-item" disabled title="Có ở bản sau">LAN Drive · sắp có</button>
+    <p class="me" id="me"></p>
+  </nav>
+  <main class="content">
+    <div id="view"></div>
+    <section id="jobs" aria-live="polite"></section>
+  </main>
+</div>
+<div id="modal"></div>
+<script src="app.js"></script>
+</body>
+</html>

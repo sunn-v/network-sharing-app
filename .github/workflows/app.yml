@@ -1,0 +1,36 @@
+name: app
+
+on:
+  push:
+    paths: ["core/**", "app/**", "Cargo.*", ".github/workflows/app.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            bundle: |
+              target/release/bundle/dmg/*.dmg
+          - os: windows-latest
+            bundle: |
+              target/release/bundle/nsis/*.exe
+              target/release/bundle/msi/*.msi
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p lanshare-core
+      # Unsigned build for testing; signing/notarizing goes through the existing release scripts.
+      - run: npx -y @tauri-apps/cli@2 build
+        working-directory: app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: network-sharing-${{ matrix.os }}
+          path: ${{ matrix.bundle }}
+          if-no-files-found: error
