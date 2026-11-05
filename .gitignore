@@ -3,3 +3,4 @@ app/gen/
 app/macos/build/
 app/macos/LANDrive.xcodeproj/
 app/macos/App.entitlements
+.env.local

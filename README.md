@@ -29,17 +29,29 @@ Workflow `build-windows` (chạy tay: `gh workflow run build-windows`) build b�
 Folder máy khác chia sẻ hiện sẵn trong Explorer/Finder nhưng chỉ tải khi mở (giống OneDrive/Google Drive). Chỉ đọc: sửa, xoá, đổi tên không đi ngược về máy gốc.
 
 - **Windows** (`app/src/ondemand/windows.rs`): Cloud Files API. `~/LAN Drive` là sync root, hiện trong Explorer kèm biểu tượng trạng thái mây. Build thường (`npx @tauri-apps/cli@2 build`) là có. Lần đầu chạy, nếu `~/LAN Drive` của bản cũ (tải bản cứng) còn đó thì nó được đổi tên thành `LAN Drive (bản cũ)`, không mất file.
-- **macOS** (`app/macos/`): File Provider extension viết bằng Swift, hiện ở thanh bên Finder dưới mục Locations. Extension hỏi app qua cầu nối HTTP trên 127.0.0.1 có token (`core/src/bridge.rs`). Phải build bằng script:
-  ```sh
-  brew install xcodegen
-  export APPLE_TEAM_ID=XXXXXXXXXX
-  export APPLE_SIGNING_IDENTITY="Developer ID Application: Tên (XXXXXXXXXX)"
-  app/macos/build.sh
-  ```
-  Kiểm tra extension giữ đúng entitlements sau khi đóng gói:
-  `codesign -d --entitlements - "target/release/bundle/macos/Network Sharing.app/Contents/PlugIns/LANDrive.appex"` phải có `app-sandbox` và `application-groups`.
-  Bản `cargo run` hoặc build không qua script sẽ không có extension; khi đó LAN Drive quay về kiểu tải bản cứng vào `~/LAN Drive`.
+- **macOS** (`app/macos/`): File Provider extension viết bằng Swift, hiện ở thanh bên Finder dưới mục Locations. Extension hỏi app qua cầu nối HTTP trên 127.0.0.1 có token (`core/src/bridge.rs`). Phải build bằng `scripts/build-mac.sh` (xem dưới). Bản `cargo run` hoặc build không qua script sẽ không có extension; khi đó LAN Drive quay về kiểu tải bản cứng vào `~/LAN Drive`.
 - **Linux**: tải bản cứng.
+
+## Build macOS
+
+Script lấy từ GomokuCafe, như các app getapps khác: ký Developer ID, notarize và staple cả .app lẫn .dmg, mặc định universal (arm64 + x86_64).
+
+Cần: chứng chỉ "Developer ID Application" trong Keychain, Xcode, `brew install xcodegen`, `cargo install tauri-cli`, và hồ sơ notary:
+
+```sh
+xcrun notarytool store-credentials "Network SharingNotary" --apple-id ... --team-id VFYA7T675R --password xxxx-xxxx-xxxx-xxxx
+echo 'NOTARY_KEYCHAIN_PROFILE="Network SharingNotary"' > .env.local
+```
+
+(Chưa có thì lần đầu chạy script hỏi luôn và tự ghi `.env.local`.)
+
+```sh
+./scripts/build-mac.sh                                # build, ký, notarize, rồi tạo GitHub Release
+SKIP_RELEASE=1 ./scripts/build-mac.sh                 # chỉ build
+./scripts/build-mac.sh --target aarch64-apple-darwin  # một kiến trúc, nhanh hơn
+```
+
+Script build extension trước, đóng gói app kèm extension, rồi ký lại extension với entitlements của nó (sandbox, App Group) và ký lại app; nó dừng nếu extension mất `app-sandbox`. Team ID lấy từ tên chứng chỉ, đặt `APPLE_TEAM_ID` nếu muốn khác. DMG nằm ở `target/universal-apple-darwin/release/bundle/dmg/`.
 
 ## Lưu ý theo hệ điều hành
 

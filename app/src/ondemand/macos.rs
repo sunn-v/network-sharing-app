@@ -2,7 +2,7 @@
 //! Finder sidebar and asks this app for listings and bytes over the localhost bridge
 //! (`lanshare_core::bridge`). The bridge's port and token go in the shared App Group container.
 //!
-//! Needs a build made with APPLE_TEAM_ID set and the extension bundled (`app/macos/build.sh`);
+//! Needs a build made with APPLE_TEAM_ID set and the extension bundled (`scripts/build-mac.sh`);
 //! a plain `cargo run` has no extension, so LAN Drive falls back to full copies there.
 
 use std::{
