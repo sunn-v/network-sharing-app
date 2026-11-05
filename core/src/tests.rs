@@ -31,8 +31,8 @@ async fn wait_until(mut f: impl FnMut() -> bool) {
 #[tokio::test(flavor = "multi_thread")]
 async fn pair_share_browse_download() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let a = Node::start(tmp.path().join("a")).await?;
-    let b = Node::start(tmp.path().join("b")).await?;
+    let a = Node::start(tmp.path().join("a"), tmp.path().join("drive-a")).await?;
+    let b = Node::start(tmp.path().join("b"), tmp.path().join("drive-b")).await?;
     let (aid, bid) = (a.id(), b.id());
 
     wait_until(|| a.devices().iter().any(|d| d.id == bid && d.online)).await;
@@ -100,8 +100,8 @@ async fn pair_share_browse_download() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn resumes_partial_download() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let a = Node::start(tmp.path().join("a")).await?;
-    let b = Node::start(tmp.path().join("b")).await?;
+    let a = Node::start(tmp.path().join("a"), tmp.path().join("drive-a")).await?;
+    let b = Node::start(tmp.path().join("b"), tmp.path().join("drive-b")).await?;
     let (aid, bid) = (a.id(), b.id());
     wait_until(|| a.devices().iter().any(|d| d.id == bid && d.online)).await;
     // Pair directly in config, as if done earlier.
@@ -112,11 +112,13 @@ async fn resumes_partial_download() -> Result<()> {
     fs::create_dir_all(&src).await?;
     let data: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
     fs::write(src.join("big.bin"), &data).await?;
-    let share = b.add_share(src, Some(aid)).await?;
+    let share = b.add_share(src.clone(), Some(aid)).await?;
 
     let dest = tmp.path().join("dl");
     fs::create_dir_all(&dest).await?;
-    fs::write(dest.join("big.bin.nspart"), &data[..400_000]).await?;
+    let mtime = fs::metadata(src.join("big.bin")).await?.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    let part = dest.join(format!("big.bin.{mtime}.nspart"));
+    fs::write(&part, &data[..400_000]).await?;
     let mut ev = a.subscribe();
     // Called from a plain thread, like a sync Tauri command (regression: used to panic).
     let a2 = a.clone();
@@ -131,6 +133,53 @@ async fn resumes_partial_download() -> Result<()> {
         }
     }
     assert_eq!(fs::read(dest.join("big.bin")).await?, data);
-    assert!(fs::metadata(dest.join("big.bin.nspart")).await.is_err());
+    assert!(fs::metadata(&part).await.is_err());
+    Ok(())
+}
+
+#[test]
+fn folder_name_is_safe() {
+    assert_eq!(folder_name("Mac mini: M4/a", "x"), "Mac mini_ M4_a");
+    assert_eq!(folder_name("..", "fallback"), "fallback");
+    assert_eq!(folder_name("Ảnh 2026", "x"), "Ảnh 2026");
+}
+
+/// Rename shows up on the other side; LAN Drive mirrors a share and picks up changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn rename_and_lan_drive() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let a = Node::start(tmp.path().join("a"), tmp.path().join("drive-a")).await?;
+    let b = Node::start(tmp.path().join("b"), tmp.path().join("drive-b")).await?;
+    let (aid, bid) = (a.id(), b.id());
+    wait_until(|| a.devices().iter().any(|d| d.id == bid && d.online)).await;
+
+    b.set_name("Máy B").await?;
+    wait_until(|| a.devices().iter().any(|d| d.id == bid && d.name == "Máy B")).await;
+    assert!(b.set_name("   ").await.is_err());
+
+    a.cfg.lock().unwrap().paired.insert(bid.clone(), "Máy B".into());
+    b.cfg.lock().unwrap().paired.insert(aid.clone(), "a".into());
+    let src = tmp.path().join("Tài liệu");
+    fs::create_dir_all(src.join("sub")).await?;
+    fs::write(src.join("sub/a.txt"), b"v1").await?;
+    let share = b.add_share(src.clone(), Some(aid.clone())).await?;
+
+    a.add_to_drive(&bid, &share.id, &share.name).await?;
+    let mirrored = tmp.path().join("drive-a/Máy B/Tài liệu/sub/a.txt");
+    let synced = |a: &Arc<Node>| a.drive().first().is_some_and(|d| d.status.state == "synced");
+    wait_until(|| synced(&a)).await;
+    assert_eq!(fs::read(&mirrored).await?, b"v1");
+
+    // Change the source (new size and mtime), run another pass, expect the new content.
+    fs::write(src.join("sub/a.txt"), b"version 2").await?;
+    std::fs::File::options().write(true).open(src.join("sub/a.txt"))?.set_modified(std::time::SystemTime::now() + Duration::from_secs(5))?;
+    let item = a.cfg.lock().unwrap().drive[0].clone();
+    a.sync_item(&item).await;
+    assert_eq!(fs::read(&mirrored).await?, b"version 2");
+    assert!(synced(&a));
+
+    a.remove_from_drive(&bid, &share.id).await?;
+    assert!(a.drive().is_empty());
+    assert!(fs::metadata(&mirrored).await.is_ok(), "removing from LAN Drive keeps the files");
     Ok(())
 }

@@ -41,13 +41,24 @@ pub struct Share {
     pub peers: BTreeSet<String>,
 }
 
+/// A remote share mirrored into the LAN Drive folder (one-way: the other device is the source).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DriveItem {
+    pub peer: String,
+    pub share: String,
+    pub name: String,
+    pub path: PathBuf,
+}
+
 #[derive(Serialize, Deserialize, Default)]
+#[serde(default)] // configs written by older versions lack newer fields
 struct Config {
     name: String,
     secret: [u8; 32],
     /// Paired devices: endpoint id -> name.
     paired: BTreeMap<String, String>,
     shares: Vec<Share>,
+    drive: Vec<DriveItem>,
 }
 
 // ---------- views sent to the UI ----------
@@ -75,6 +86,25 @@ pub struct Entry {
     pub modified: u64,
 }
 
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct DriveStatus {
+    /// "waiting" (device offline), "syncing", "synced" or "error".
+    pub state: String,
+    pub done: u64,
+    pub total: u64,
+    pub message: String,
+    /// Seconds since the Unix epoch of the last finished sync, 0 if never.
+    pub last_sync: u64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct DriveView {
+    #[serde(flatten)]
+    pub item: DriveItem,
+    pub peer_name: String,
+    pub status: DriveStatus,
+}
+
 #[derive(Serialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Event {
@@ -82,6 +112,15 @@ pub enum Event {
     PairRequest { id: String, name: String, code: String },
     Progress { job: u64, done: u64, total: u64, file: String },
     JobDone { job: u64, error: Option<String> },
+    Drive,
+}
+
+/// One file to fetch: remote path in the share, where it goes, and what the remote reported.
+struct FileJob {
+    remote: String,
+    local: PathBuf,
+    size: u64,
+    modified: u64,
 }
 
 // ---------- wire messages ----------
@@ -109,8 +148,9 @@ enum Resp {
 
 pub struct Node {
     ep: Endpoint,
-    /// Kept alive: it advertises us and browses for others on every interface.
-    _mdns: ServiceDaemon,
+    /// Advertises us and browses for others on every interface.
+    mdns: ServiceDaemon,
+    mdns_port: u16,
     lookup: MemoryLookup,
     data_dir: PathBuf,
     cfg: Mutex<Config>,
@@ -121,11 +161,14 @@ pub struct Node {
     next_job: Mutex<u64>,
     /// Runtime to spawn jobs on, so `download` works from non-async callers too.
     rt: tokio::runtime::Handle,
+    drive_root: PathBuf,
+    drive_status: Mutex<HashMap<(String, String), DriveStatus>>,
 }
 
 impl Node {
-    /// Load (or create) the config in `data_dir`, bind the endpoint and start discovery and serving.
-    pub async fn start(data_dir: PathBuf) -> Result<Arc<Node>> {
+    /// Load (or create) the config in `data_dir`, bind the endpoint and start discovery, serving
+    /// and LAN Drive syncing into `drive_root`.
+    pub async fn start(data_dir: PathBuf, drive_root: PathBuf) -> Result<Arc<Node>> {
         fs::create_dir_all(&data_dir).await?;
         let cfg = match fs::read(data_dir.join("config.json")).await {
             Ok(bytes) => serde_json::from_slice(&bytes).context("config.json is corrupt")?,
@@ -145,16 +188,13 @@ impl Node {
         let lookup = MemoryLookup::new();
         ep.address_lookup()?.add(lookup.clone());
         let mdns = ServiceDaemon::new()?;
-        let id = ep.id().to_string();
-        let port = ep.bound_sockets().iter().find(|a| a.is_ipv4()).map(|a| a.port()).context("no IPv4 socket")?;
-        let instance = &id[..32]; // DNS labels max 63 bytes; the full id goes in TXT
-        let props = [("id", id.as_str()), ("name", cfg.name.as_str())];
-        mdns.register(ServiceInfo::new(SERVICE, instance, &format!("{instance}.local."), "", port, &props[..])?.enable_addr_auto())?;
+        let mdns_port = ep.bound_sockets().iter().find(|a| a.is_ipv4()).map(|a| a.port()).context("no IPv4 socket")?;
         let events = mdns.browse(SERVICE)?;
 
         let node = Arc::new(Node {
             ep,
-            _mdns: mdns,
+            mdns,
+            mdns_port,
             lookup,
             data_dir,
             cfg: Mutex::new(cfg),
@@ -163,11 +203,34 @@ impl Node {
             events: broadcast::channel(256).0,
             next_job: Mutex::new(1),
             rt: tokio::runtime::Handle::current(),
+            drive_root,
+            drive_status: Mutex::default(),
         });
         node.save().await?;
+        node.advertise()?;
         tokio::spawn(node.clone().discover(events));
         tokio::spawn(node.clone().serve());
+        tokio::spawn(node.clone().drive_loop());
         Ok(node)
+    }
+
+    /// (Re-)announce this device; calling it again updates the advertised name.
+    fn advertise(&self) -> Result<()> {
+        let id = self.id();
+        let instance = &id[..32]; // DNS labels max 63 bytes; the full id goes in TXT
+        let name = self.name();
+        let props = [("id", id.as_str()), ("name", name.as_str())];
+        let info = ServiceInfo::new(SERVICE, instance, &format!("{instance}.local."), "", self.mdns_port, &props[..])?;
+        self.mdns.register(info.enable_addr_auto())?;
+        Ok(())
+    }
+
+    pub async fn set_name(&self, name: &str) -> Result<()> {
+        let name = name.trim();
+        ensure!(!name.is_empty() && name.len() <= 63, "tên máy phải từ 1 đến 63 ký tự");
+        self.cfg.lock().unwrap().name = name.to_string();
+        self.save().await?;
+        self.advertise()
     }
 
     pub fn id(&self) -> String {
@@ -332,7 +395,7 @@ impl Node {
     }
 
     async fn run_download(&self, job: u64, peer: &str, share: &str, paths: &[String], dest: &Path) -> Result<()> {
-        // 1. Expand folders into a flat file list: (remote path, local path, size).
+        // Expand folders into a flat file list.
         let mut files = vec![];
         for p in paths {
             let rel = safe_rel(p)?;
@@ -346,20 +409,29 @@ impl Node {
                 .with_context(|| format!("{p} not found"))?;
             self.collect(peer, share, p, &entry, dest.join(name), &mut files).await?;
         }
-        let total: u64 = files.iter().map(|f| f.2).sum();
+        self.fetch(peer, share, files, false, |done, total, file| {
+            self.emit(Event::Progress { job, done, total, file: file.to_string() })
+        })
+        .await
+    }
+
+    /// Fetch each file, resuming a partial download if one exists. With `replace`, an existing
+    /// local file is overwritten (LAN Drive mirror); otherwise a free name is picked.
+    async fn fetch(&self, peer: &str, share: &str, files: Vec<FileJob>, replace: bool, progress: impl Fn(u64, u64, &str)) -> Result<()> {
+        let total: u64 = files.iter().map(|f| f.size).sum();
         let mut done = 0;
-        // 2. Fetch each file, resuming a partial download if one exists.
-        for (remote, local, size) in files {
-            if let Some(dir) = local.parent() {
+        for f in files {
+            if let Some(dir) = f.local.parent() {
                 fs::create_dir_all(dir).await?;
             }
-            let part = local.with_file_name(format!("{}.nspart", local.file_name().unwrap().to_string_lossy()));
-            let offset = fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0).min(size);
+            // The remote mtime is in the name, so a file that changed meanwhile starts over.
+            let part = f.local.with_file_name(format!("{}.{}.nspart", f.local.file_name().unwrap().to_string_lossy(), f.modified));
+            let offset = fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0).min(f.size);
             let mut out = fs::OpenOptions::new().create(true).append(true).open(&part).await?;
             let (mut send, mut recv) = self.open(peer).await?;
-            write_msg(&mut send, &Req::Read { share: share.into(), path: remote.clone(), offset }).await?;
+            write_msg(&mut send, &Req::Read { share: share.into(), path: f.remote.clone(), offset }).await?;
             match read_msg::<Resp>(&mut recv).await? {
-                Resp::Read { size: s } => ensure!(s == size, "{remote} changed on the other device"),
+                Resp::Read { size } => ensure!(size == f.size, "{} changed on the other device", f.remote),
                 Resp::Error { msg } => bail!(msg),
                 _ => bail!("unexpected reply"),
             }
@@ -375,16 +447,20 @@ impl Node {
                 done += n as u64;
                 if last.elapsed() > Duration::from_millis(150) {
                     last = std::time::Instant::now();
-                    self.emit(Event::Progress { job, done, total, file: remote.clone() });
+                    progress(done, total, &f.remote);
                 }
             }
             out.flush().await?;
             drop(out);
             let got = fs::metadata(&part).await?.len();
-            ensure!(got == size, "{remote}: got {got} of {size} bytes, will resume next time");
-            fs::rename(&part, unique_path(&local).await).await?;
+            ensure!(got == f.size, "{}: got {got} of {} bytes, will resume next time", f.remote, f.size);
+            let target = if replace { f.local.clone() } else { unique_path(&f.local).await };
+            fs::rename(&part, &target).await?;
+            // Keep the remote mtime: LAN Drive compares it to skip unchanged files.
+            let mtime = std::time::UNIX_EPOCH + Duration::from_secs(f.modified);
+            std::fs::File::options().write(true).open(&target)?.set_modified(mtime)?;
         }
-        self.emit(Event::Progress { job, done: total, total, file: String::new() });
+        progress(total, total, "");
         Ok(())
     }
 
@@ -395,21 +471,134 @@ impl Node {
         remote: &'a str,
         entry: &'a Entry,
         local: PathBuf,
-        files: &'a mut Vec<(String, PathBuf, u64)>,
+        files: &'a mut Vec<FileJob>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             if !entry.is_dir {
-                files.push((remote.to_string(), local, entry.size));
+                files.push(FileJob { remote: remote.to_string(), local, size: entry.size, modified: entry.modified });
                 return Ok(());
             }
             for child in self.remote_list(peer, share, remote).await? {
                 safe_rel(&child.name)?; // names come from another machine
-                let child_remote = format!("{remote}/{}", child.name);
+                if child.name.ends_with(".nspart") {
+                    continue; // someone else's half-finished download
+                }
+                let child_remote = if remote.is_empty() { child.name.clone() } else { format!("{remote}/{}", child.name) };
                 let child_local = local.join(&child.name);
                 self.collect(peer, share, &child_remote, &child, child_local, files).await?;
             }
             Ok(())
         })
+    }
+
+    // ----- LAN Drive -----
+
+    pub fn drive(&self) -> Vec<DriveView> {
+        let items = self.cfg.lock().unwrap().drive.clone();
+        let devices = self.devices();
+        let status = self.drive_status.lock().unwrap();
+        items
+            .into_iter()
+            .map(|item| {
+                let d = devices.iter().find(|d| d.id == item.peer);
+                let mut st = status.get(&(item.peer.clone(), item.share.clone())).cloned().unwrap_or_default();
+                if st.state.is_empty() || (st.state != "syncing" && !d.is_some_and(|d| d.online)) {
+                    st.state = "waiting".into();
+                }
+                DriveView { peer_name: d.map(|d| d.name.clone()).unwrap_or_default(), status: st, item }
+            })
+            .collect()
+    }
+
+    pub fn drive_root(&self) -> &Path {
+        &self.drive_root
+    }
+
+    /// Mirror a remote share into `<drive root>/<device>/<share>` and keep it updated.
+    pub async fn add_to_drive(self: &Arc<Self>, peer: &str, share: &str, name: &str) -> Result<()> {
+        let device = self.devices().into_iter().find(|d| d.id == peer).map(|d| d.name).unwrap_or_default();
+        let path = self.drive_root.join(folder_name(&device, &peer[..8])).join(folder_name(name, share));
+        {
+            let mut cfg = self.cfg.lock().unwrap();
+            if cfg.drive.iter().any(|i| i.peer == peer && i.share == share) {
+                return Ok(());
+            }
+            cfg.drive.push(DriveItem { peer: peer.into(), share: share.into(), name: name.into(), path });
+        }
+        self.save().await?;
+        self.emit(Event::Drive);
+        let item = self.cfg.lock().unwrap().drive.last().cloned().unwrap();
+        let node = self.clone();
+        self.rt.spawn(async move { node.sync_item(&item).await });
+        Ok(())
+    }
+
+    /// Stop mirroring. Files already in LAN Drive stay where they are.
+    pub async fn remove_from_drive(&self, peer: &str, share: &str) -> Result<()> {
+        self.cfg.lock().unwrap().drive.retain(|i| !(i.peer == peer && i.share == share));
+        self.drive_status.lock().unwrap().remove(&(peer.to_string(), share.to_string()));
+        self.save().await?;
+        self.emit(Event::Drive);
+        Ok(())
+    }
+
+    async fn drive_loop(self: Arc<Self>) {
+        loop {
+            let items = self.cfg.lock().unwrap().drive.clone();
+            for item in items {
+                let online = self.seen.lock().unwrap().get(&item.peer).is_some_and(|s| s.1);
+                if online {
+                    self.sync_item(&item).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(20)).await;
+        }
+    }
+
+    fn set_drive_status(&self, item: &DriveItem, f: impl FnOnce(&mut DriveStatus)) {
+        let key = (item.peer.clone(), item.share.clone());
+        f(self.drive_status.lock().unwrap().entry(key).or_default());
+        self.emit(Event::Drive);
+    }
+
+    /// One pass: download every remote file whose size or mtime differs from the local copy.
+    // shortcut: files deleted or renamed on the source stay in LAN Drive; add deletion once there is a trash/undo story.
+    async fn sync_item(&self, item: &DriveItem) {
+        {
+            let mut st = self.drive_status.lock().unwrap();
+            let s = st.entry((item.peer.clone(), item.share.clone())).or_default();
+            if s.state == "syncing" {
+                return; // another pass is already running
+            }
+            s.state = "syncing".into();
+        }
+        self.emit(Event::Drive);
+        let res: Result<()> = async {
+            let root = Entry { name: String::new(), is_dir: true, size: 0, modified: 0 };
+            let mut files = vec![];
+            self.collect(&item.peer, &item.share, "", &root, item.path.clone(), &mut files).await?;
+            let mut changed = vec![];
+            for f in files {
+                let same = fs::metadata(&f.local).await.is_ok_and(|m| {
+                    let mtime = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+                    m.len() == f.size && mtime == f.modified
+                });
+                if !same {
+                    changed.push(f);
+                }
+            }
+            fs::create_dir_all(&item.path).await?;
+            self.fetch(&item.peer, &item.share, changed, true, |done, total, _| {
+                self.set_drive_status(item, |s| (s.done, s.total) = (done, total))
+            })
+            .await
+        }
+        .await;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        self.set_drive_status(item, |s| match res {
+            Ok(()) => *s = DriveStatus { state: "synced".into(), last_sync: now, ..Default::default() },
+            Err(e) => (s.state, s.message) = ("error".into(), format!("{e:#}")),
+        });
     }
 
     async fn open(&self, peer: &str) -> Result<(SendStream, RecvStream)> {
@@ -584,6 +773,13 @@ async fn resolve(root: &Path, rel: &str) -> Result<PathBuf> {
     let full = fs::canonicalize(root.join(safe_rel(rel)?)).await.context("not found")?;
     ensure!(full.starts_with(fs::canonicalize(root).await?), "outside the shared folder");
     Ok(full)
+}
+
+/// A device or share name (from another machine) turned into one safe folder name.
+fn folder_name(name: &str, fallback: &str) -> String {
+    let clean: String = name.chars().map(|c| if c.is_control() || r#"/\:*?"<>|"#.contains(c) { '_' } else { c }).collect();
+    let clean = clean.trim().trim_matches('.').to_string();
+    if clean.is_empty() { fallback.to_string() } else { clean }
 }
 
 fn parent_of(p: &str) -> &str {

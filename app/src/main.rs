@@ -3,9 +3,10 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use lanshare_core::{Device, Entry, Node, RemoteShare};
+use lanshare_core::{Device, DriveView, Entry, Node, RemoteShare};
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_opener::OpenerExt;
 
 type N<'a> = State<'a, Arc<Node>>;
 type R<T> = Result<T, String>;
@@ -18,6 +19,7 @@ fn err(e: anyhow::Error) -> String {
 struct Snapshot {
     id: String,
     name: String,
+    drive_root: String,
     devices: Vec<Device>,
 }
 
@@ -31,7 +33,47 @@ struct LocalShare {
 
 #[tauri::command]
 fn snapshot(node: N) -> Snapshot {
-    Snapshot { id: node.id(), name: node.name(), devices: node.devices() }
+    Snapshot { id: node.id(), name: node.name(), drive_root: node.drive_root().display().to_string(), devices: node.devices() }
+}
+
+#[tauri::command]
+async fn set_name(node: N<'_>, name: String) -> R<()> {
+    node.set_name(&name).await.map_err(err)
+}
+
+#[tauri::command]
+fn drive_list(node: N) -> Vec<DriveView> {
+    node.drive()
+}
+
+#[tauri::command]
+async fn add_to_drive(node: N<'_>, peer: String, share: String, name: String) -> R<()> {
+    node.add_to_drive(&peer, &share, &name).await.map_err(err)
+}
+
+#[tauri::command]
+async fn remove_from_drive(node: N<'_>, peer: String, share: String) -> R<()> {
+    node.remove_from_drive(&peer, &share).await.map_err(err)
+}
+
+/// Open a folder in Finder/Explorer. Only LAN Drive and the download folder, never arbitrary paths.
+#[tauri::command]
+fn open_path(app: tauri::AppHandle, node: N, path: String) -> R<()> {
+    let path = PathBuf::from(path);
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err("không mở được đường dẫn này".into());
+    }
+    let allowed = [node.drive_root().to_path_buf(), downloads(&app)?];
+    if !allowed.iter().any(|root| path.starts_with(root)) {
+        return Err("không mở được đường dẫn này".into());
+    }
+    std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    app.opener().open_path(path.display().to_string(), None::<&str>).map_err(|e| e.to_string())
+}
+
+fn downloads(app: &tauri::AppHandle) -> R<PathBuf> {
+    let base = app.path().download_dir().or_else(|_| app.path().home_dir().map(|h| h.join("Downloads")));
+    Ok(base.map_err(|e| e.to_string())?.join("Network Sharing"))
 }
 
 #[tauri::command]
@@ -85,8 +127,7 @@ async fn remote_list(node: N<'_>, peer: String, share: String, path: String) -> 
 /// Downloads land in ~/Downloads/Network Sharing.
 #[tauri::command]
 fn download(app: tauri::AppHandle, node: N, peer: String, share: String, paths: Vec<String>) -> R<(u64, String)> {
-    let base = app.path().download_dir().or_else(|_| app.path().home_dir().map(|h| h.join("Downloads")));
-    let dest = base.map_err(|e| e.to_string())?.join("Network Sharing");
+    let dest = downloads(&app)?;
     std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
     Ok((node.download(peer, share, paths, dest.clone()), dest.display().to_string()))
 }
@@ -94,9 +135,11 @@ fn download(app: tauri::AppHandle, node: N, peer: String, share: String, paths: 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
-            let node = tauri::async_runtime::block_on(Node::start(dir))?;
+            let drive = app.path().home_dir()?.join("LAN Drive");
+            let node = tauri::async_runtime::block_on(Node::start(dir, drive))?;
             // Forward core events to the window.
             let mut rx = node.subscribe();
             let handle = app.handle().clone();
@@ -110,6 +153,11 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
+            set_name,
+            drive_list,
+            add_to_drive,
+            remove_from_drive,
+            open_path,
             pair_code,
             request_pair,
             answer_pair,
