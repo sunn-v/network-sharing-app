@@ -15,10 +15,9 @@ use anyhow::{Context, Result, bail, ensure};
 use iroh::{
     Endpoint, EndpointId, SecretKey,
     endpoint::{Connection, RecvStream, SendStream, presets},
-    endpoint_info::UserData,
 };
-use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
-use n0_future::StreamExt;
+use iroh::{EndpointAddr, TransportAddr, address_lookup::MemoryLookup};
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -28,7 +27,7 @@ use tokio::{
 };
 
 const ALPN: &[u8] = b"network-sharing/1";
-const SERVICE: &str = "netshare";
+const SERVICE: &str = "_netshare._udp.local.";
 const MAX_MSG: u32 = 4 * 1024 * 1024;
 
 // ---------- persisted state ----------
@@ -110,7 +109,9 @@ enum Resp {
 
 pub struct Node {
     ep: Endpoint,
-    _mdns: MdnsAddressLookup,
+    /// Kept alive: it advertises us and browses for others on every interface.
+    _mdns: ServiceDaemon,
+    lookup: MemoryLookup,
     data_dir: PathBuf,
     cfg: Mutex<Config>,
     /// Devices seen on the LAN: id -> (name, online).
@@ -139,13 +140,22 @@ impl Node {
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await?;
-        let mdns = MdnsAddressLookup::builder().service_name(SERVICE).build(ep.id())?;
-        ep.address_lookup()?.add(mdns.clone());
-        ep.set_user_data_for_address_lookup(Some(UserData::try_from(cfg.name.clone())?));
+        // Discovery: mdns-sd sends on every interface (the default-interface-only approach
+        // misses peers when a VPN or a Hyper-V/WSL adapter owns the default route).
+        let lookup = MemoryLookup::new();
+        ep.address_lookup()?.add(lookup.clone());
+        let mdns = ServiceDaemon::new()?;
+        let id = ep.id().to_string();
+        let port = ep.bound_sockets().iter().find(|a| a.is_ipv4()).map(|a| a.port()).context("no IPv4 socket")?;
+        let instance = &id[..32]; // DNS labels max 63 bytes; the full id goes in TXT
+        let props = [("id", id.as_str()), ("name", cfg.name.as_str())];
+        mdns.register(ServiceInfo::new(SERVICE, instance, &format!("{instance}.local."), "", port, &props[..])?.enable_addr_auto())?;
+        let events = mdns.browse(SERVICE)?;
 
         let node = Arc::new(Node {
             ep,
-            _mdns: mdns.clone(),
+            _mdns: mdns,
+            lookup,
             data_dir,
             cfg: Mutex::new(cfg),
             seen: Mutex::default(),
@@ -155,7 +165,7 @@ impl Node {
             rt: tokio::runtime::Handle::current(),
         });
         node.save().await?;
-        tokio::spawn(node.clone().discover(mdns));
+        tokio::spawn(node.clone().discover(events));
         tokio::spawn(node.clone().serve());
         Ok(node)
     }
@@ -420,17 +430,17 @@ impl Node {
 
     // ----- background tasks -----
 
-    async fn discover(self: Arc<Self>, mdns: MdnsAddressLookup) {
-        let mut events = mdns.subscribe().await;
+    async fn discover(self: Arc<Self>, events: mdns_sd::Receiver<ServiceEvent>) {
         let me = self.id();
-        while let Some(ev) = events.next().await {
+        while let Ok(ev) = events.recv_async().await {
             match ev {
-                DiscoveryEvent::Discovered { endpoint_info, .. } => {
-                    let id = endpoint_info.endpoint_id.to_string();
-                    if id == me {
-                        continue;
-                    }
-                    let name = endpoint_info.data.user_data().map(|u| u.to_string()).unwrap_or_default();
+                ServiceEvent::ServiceResolved(svc) => {
+                    let Some(id) = svc.get_property_val_str("id").filter(|id| *id != me) else { continue };
+                    let Ok(eid) = id.parse::<EndpointId>() else { continue };
+                    let id = id.to_string();
+                    let name = svc.get_property_val_str("name").unwrap_or_default().to_string();
+                    let addrs = svc.get_addresses_v4().into_iter().map(|ip| TransportAddr::Ip((ip, svc.get_port()).into()));
+                    self.lookup.add_endpoint_info(EndpointAddr::from_parts(eid, addrs));
                     let changed = self.seen.lock().unwrap().insert(id.clone(), (name.clone(), true)) != Some((name.clone(), true));
                     // Keep a paired device's stored name current.
                     if let Some(n) = self.cfg.lock().unwrap().paired.get_mut(&id) {
@@ -442,9 +452,12 @@ impl Node {
                         self.emit(Event::Devices);
                     }
                 }
-                DiscoveryEvent::Expired { endpoint_id } => {
-                    if let Some(d) = self.seen.lock().unwrap().get_mut(&endpoint_id.to_string()) {
-                        d.1 = false;
+                ServiceEvent::ServiceRemoved(_, fullname) => {
+                    let instance = fullname.split('.').next().unwrap_or_default().to_string();
+                    for (id, d) in self.seen.lock().unwrap().iter_mut() {
+                        if id.starts_with(&instance) {
+                            d.1 = false;
+                        }
                     }
                     self.emit(Event::Devices);
                 }
