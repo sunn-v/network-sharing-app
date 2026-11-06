@@ -239,7 +239,7 @@ async fn bridge_lists_and_reads() -> Result<()> {
     a.cfg.lock().unwrap().paired.insert(bid.clone(), "b".into());
     b.cfg.lock().unwrap().paired.insert(aid.clone(), "a".into());
     b.set_name("Máy B").await?;
-    wait_until(|| a.devices().iter().any(|d| d.name == "Máy B")).await;
+    wait_until(|| a.devices().iter().any(|d| d.id == bid && d.name == "Máy B")).await;
 
     let src = tmp.path().join("Ảnh");
     fs::create_dir_all(src.join("Đà Lạt")).await?;
