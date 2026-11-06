@@ -175,13 +175,18 @@ echo "→ Building LAN Drive extension..."
     cd app/macos
     xcodegen generate --quiet
     # Release builds arm64 + x86_64 (ONLY_ACTIVE_ARCH is off in Release). Unsigned here:
-    # Xcode would demand an installed profile; we sign below with the profile embedded.
+    # Xcode would demand an installed profile; we sign it ourselves just below.
     xcodebuild -quiet -project LANDrive.xcodeproj -target LANDrive -configuration Release \
         SYMROOT="$PWD/build" DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGNING_ALLOWED=NO build
 )
 # The extension's entitlements (sandbox, App Group, network client), team prefix filled in.
 EXT_ENTITLEMENTS="app/macos/build/LANDrive.entitlements"
 sed "s/\$(TeamIdentifierPrefix)/${APPLE_TEAM_ID}./" app/macos/LANDrive/LANDrive.entitlements > "$EXT_ENTITLEMENTS"
+# Sign it before Tauri bundles: codesign refuses an app whose nested code is unsigned.
+EXT_BUILT="app/macos/build/Release/LANDrive.appex"
+cp app/macos/LANDrive.provisionprofile "$EXT_BUILT/Contents/embedded.provisionprofile"
+codesign --force --sign "$APPLE_SIGNING_IDENTITY" --options runtime --timestamp \
+    --entitlements "$EXT_ENTITLEMENTS" "$EXT_BUILT"
 
 # The app's entitlements: the same cs.* set as the other getapps.cafe apps, plus the App
 # Group shared with the extension (bridge.json lives in its container).
@@ -240,7 +245,6 @@ if [ ! -d "$APPEX" ]; then
     echo "✗ LAN Drive extension missing from $APP" >&2
     exit 1
 fi
-cp app/macos/LANDrive.provisionprofile "$APPEX/Contents/embedded.provisionprofile"
 cp app/embedded.provisionprofile "$APP/Contents/embedded.provisionprofile"
 echo "→ Re-signing LAN Drive extension + app"
 codesign --force --sign "$APPLE_SIGNING_IDENTITY" --options runtime --timestamp \
