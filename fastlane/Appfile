@@ -1,0 +1,3 @@
+# Bundle identifier is read dynamically from app/tauri.conf.json
+# (see Fastfile read_bundle_id_from_tauri_conf).
+# Apple Developer account info comes from .env.local via App Store Connect API.

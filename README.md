@@ -45,13 +45,21 @@ echo 'NOTARY_KEYCHAIN_PROFILE="Network SharingNotary"' > .env.local
 
 (Chưa có thì lần đầu chạy script hỏi luôn và tự ghi `.env.local`.)
 
+Provisioning profile (một lần, cần `brew install fastlane` và App Store Connect API key trong `.env.local`: `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`, `APPLE_API_KEY_PATH`):
+
+```sh
+./scripts/provision-mac.sh
+```
+
+Nó đăng ký 2 App ID (`cafe.getapps.networksharing` và `cafe.getapps.networksharing.LANDrive`) rồi tải profile Developer ID về `app/embedded.provisionprofile` và `app/macos/LANDrive.provisionprofile` (đã gitignore). Đổi bundle ID thì chạy lại.
+
 ```sh
 ./scripts/build-mac.sh                                # build, ký, notarize, rồi tạo GitHub Release
 SKIP_RELEASE=1 ./scripts/build-mac.sh                 # chỉ build
 ./scripts/build-mac.sh --target aarch64-apple-darwin  # một kiến trúc, nhanh hơn
 ```
 
-Script build extension trước, đóng gói app kèm extension, rồi ký lại extension với entitlements của nó (sandbox, App Group) và ký lại app; nó dừng nếu extension mất `app-sandbox`. Team ID lấy từ tên chứng chỉ, đặt `APPLE_TEAM_ID` nếu muốn khác. DMG nằm ở `target/universal-apple-darwin/release/bundle/dmg/`.
+Script build extension trước (chưa ký), đóng gói app kèm extension, nhét profile vào cả hai, rồi ký lại extension với entitlements của nó (sandbox, App Group) và ký lại app; nó dừng nếu extension mất `app-sandbox`. Team ID lấy từ tên chứng chỉ, đặt `APPLE_TEAM_ID` nếu muốn khác. DMG nằm ở `target/universal-apple-darwin/release/bundle/dmg/`.
 
 ## Lưu ý theo hệ điều hành
 

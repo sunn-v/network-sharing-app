@@ -1,0 +1,69 @@
+default_platform(:mac)
+
+# Copied from GomokuCafe. Differences: reads app/tauri.conf.json, and also provisions the
+# LAN Drive File Provider extension (<bundle id>.LANDrive), which needs its own App ID.
+
+platform :mac do
+  desc "Register App IDs + download Developer ID provisioning profiles (app + LAN Drive)"
+  lane :provision do
+    bundle_id = ENV.fetch("BUNDLE_ID") { read_bundle_id_from_tauri_conf }
+    product_name = ENV.fetch("PRODUCT_NAME") { read_product_from_tauri_conf }
+
+    # Auth via App Store Connect API key (returns a hash sigh will pick up).
+    api_key = app_store_connect_api_key(
+      key_id: ENV.fetch("APPLE_API_KEY_ID"),
+      issuer_id: ENV.fetch("APPLE_API_ISSUER_ID"),
+      key_filepath: ENV.fetch("APPLE_API_KEY_PATH")
+    )
+    # produce needs an Apple ID login (not API key); use Spaceship::ConnectAPI directly.
+    Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.from(hash: api_key)
+
+    # [App ID, name on the portal, output dir, profile file name]
+    [
+      [bundle_id, product_name, "app", "embedded"],
+      ["#{bundle_id}.LANDrive", "#{product_name} LAN Drive", "app/macos", "LANDrive"]
+    ].each do |id, name, output_dir, base|
+      UI.message("Bundle ID: #{id}")
+
+      # ── Register App ID (idempotent) ──────────────────────────
+      if Spaceship::ConnectAPI::BundleId.find(id)
+        UI.message("App ID '#{id}' already registered — skipping create")
+      else
+        UI.message("Registering App ID '#{id}' for macOS…")
+        Spaceship::ConnectAPI::BundleId.create(
+          name: name,
+          identifier: id,
+          platform: Spaceship::ConnectAPI::BundleIdPlatform::MAC_OS
+        )
+      end
+
+      # ── Download Developer ID provisioning profile ────────────
+      # sigh's --filename enforces .mobileprovision; rename afterwards.
+      sigh(
+        developer_id: true,
+        platform: "macos",
+        app_identifier: id,
+        output_path: output_dir,
+        filename: "#{base}.mobileprovision",
+        force: true
+      )
+
+      # sigh writes paths relative to the repo root (the wrapper script does `cd`).
+      repo_root = File.expand_path("..", __dir__)
+      src  = File.join(repo_root, output_dir, "#{base}.mobileprovision")
+      dest = File.join(repo_root, output_dir, "#{base}.provisionprofile")
+      FileUtils.mv(src, dest)
+      UI.success("Profile written to #{dest}")
+    end
+  end
+end
+
+def read_bundle_id_from_tauri_conf
+  conf = File.read("../app/tauri.conf.json", encoding: "UTF-8")
+  conf.match(/"identifier"\s*:\s*"([^"]+)"/)[1]
+end
+
+def read_product_from_tauri_conf
+  conf = File.read("../app/tauri.conf.json", encoding: "UTF-8")
+  conf.match(/"productName"\s*:\s*"([^"]+)"/)[1]
+end

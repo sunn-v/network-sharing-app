@@ -164,19 +164,24 @@ if ! command -v xcodegen >/dev/null 2>&1; then
     echo "✗ xcodegen not found. Install: brew install xcodegen" >&2
     exit 1
 fi
+for profile in app/embedded.provisionprofile app/macos/LANDrive.provisionprofile; do
+    if [ ! -f "$profile" ]; then
+        echo "✗ Missing $profile. Run once: ./scripts/provision-mac.sh" >&2
+        exit 1
+    fi
+done
 echo "→ Building LAN Drive extension..."
 (
     cd app/macos
     xcodegen generate --quiet
-    # Release builds arm64 + x86_64 (ONLY_ACTIVE_ARCH is off in Release).
+    # Release builds arm64 + x86_64 (ONLY_ACTIVE_ARCH is off in Release). Unsigned here:
+    # Xcode would demand an installed profile; we sign below with the profile embedded.
     xcodebuild -quiet -project LANDrive.xcodeproj -target LANDrive -configuration Release \
-        SYMROOT="$PWD/build" DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Manual \
-        CODE_SIGN_IDENTITY="$APPLE_SIGNING_IDENTITY" OTHER_CODE_SIGN_FLAGS=--timestamp build
+        SYMROOT="$PWD/build" DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGNING_ALLOWED=NO build
 )
-# Keep the extension's entitlements (sandbox, App Group, network client) to re-sign it
-# with after Tauri bundles the app.
-EXT_ENTITLEMENTS="app/macos/build/LANDrive.entitlements.xml"
-codesign -d --entitlements - --xml app/macos/build/Release/LANDrive.appex > "$EXT_ENTITLEMENTS"
+# The extension's entitlements (sandbox, App Group, network client), team prefix filled in.
+EXT_ENTITLEMENTS="app/macos/build/LANDrive.entitlements"
+sed "s/\$(TeamIdentifierPrefix)/${APPLE_TEAM_ID}./" app/macos/LANDrive/LANDrive.entitlements > "$EXT_ENTITLEMENTS"
 
 # The app's entitlements: the same cs.* set as the other getapps.cafe apps, plus the App
 # Group shared with the extension (bridge.json lives in its container).
@@ -224,17 +229,19 @@ if [ -z "$APP" ]; then
     exit 1
 fi
 
-# ─── Re-sign: extension with its own entitlements, then the app ──
+# ─── Embed provisioning profiles + re-sign ───────────────────────
 #
-# Tauri may sign nested code with the app's settings, dropping the extension's sandbox and
-# App Group; macOS then won't load it. No --deep for the same reason. No provisioning
-# profile: a Team-ID-prefixed App Group doesn't need one on macOS.
+# Profiles come from ./scripts/provision-mac.sh (run once). Tauri embeds neither, and may
+# sign the extension with the app's settings (dropping its sandbox + App Group), so sign
+# the extension with its own entitlements, then the app. No --deep for the same reason.
 
 APPEX="$APP/Contents/PlugIns/LANDrive.appex"
 if [ ! -d "$APPEX" ]; then
     echo "✗ LAN Drive extension missing from $APP" >&2
     exit 1
 fi
+cp app/macos/LANDrive.provisionprofile "$APPEX/Contents/embedded.provisionprofile"
+cp app/embedded.provisionprofile "$APP/Contents/embedded.provisionprofile"
 echo "→ Re-signing LAN Drive extension + app"
 codesign --force --sign "$APPLE_SIGNING_IDENTITY" --options runtime --timestamp \
     --entitlements "$EXT_ENTITLEMENTS" "$APPEX"
